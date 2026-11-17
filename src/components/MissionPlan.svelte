@@ -163,17 +163,29 @@
       return;
     }
 
+    const alreadyFlying = get(mavStateStore) !== 'STANDBY';
+
+    // Build modal description based on whether we're on the ground or airborne
+    const sequenceText = alreadyFlying
+      ? `Vehicle is <b>already airborne</b>.<br><br>` +
+        `Sequence:<br>` +
+        `1. Set RTL_ALT (safety altitude on return)<br>` +
+        `2. Switch to GUIDED mode<br>` +
+        `3. Switch to AUTO mode → mission begins<br><br>`
+      : `Vehicle is on the <b>ground</b>.<br><br>` +
+        `Sequence:<br>` +
+        `1. Set RTL_ALT (safety altitude on return)<br>` +
+        `2. Switch to GUIDED mode & arm<br>` +
+        `3. Issue NAV_TAKEOFF<br>` +
+        `4. Switch to AUTO mode → mission begins<br><br>`;
+
     let modal = new Modal({
       target: document.body,
       props: {
-        title: '🚀 Arm & Start Mission',
+        title: alreadyFlying ? '▶️ Start Mission (In Air)' : '🚀 Arm & Start Mission',
         content:
           `<b>Mission:</b> ${get(missionPlanTitleStore)}<br><br>` +
-          `Sequence:<br>` +
-          `1. Set RTL_ALT (safety altitude on return)<br>` +
-          `2. Arm the vehicle<br>` +
-          `3. Issue NAV_TAKEOFF<br>` +
-          `4. Switch to AUTO mode<br><br>` +
+          sequenceText +
           `Specify RTL_ALT in <b>metres</b>. Consider obstacles on the return path.`,
         isOpen: true,
         confirmation: true,
@@ -199,23 +211,25 @@
             await writeParameter('RTL_CLIMB_MIN', 0, rtlClimbParam.param_type);
           }
 
-          if (get(mavStateStore) === 'STANDBY') {
+          if (!alreadyFlying) {
+            // ── ON THE GROUND: arm → takeoff → AUTO ──────────────────────────
+
             // Step 2 — Switch to GUIDED (required before arming from GCS)
             await sendMavlinkCommand('DO_SET_MODE', `${[1, 4]}`, true);
             await new Promise(resolve => setTimeout(resolve, 300));
 
-            // Step 2b ? Disable RC failsafes so GCS-only flight works without RC transmitter
+            // Step 2b — Disable RC failsafes so GCS-only flight works without RC transmitter
             // FS_THR_ENABLE=0: disable RC throttle failsafe
             // RC_OVERRIDE_TIME=-1: GCS override never expires
             await writeParam('FS_THR_ENABLE', 0, 6);
             await writeParam('RC_OVERRIDE_TIME', -1, 9);
             await new Promise(resolve => setTimeout(resolve, 500));
 
-            // Step 3 -- Disable ARMING_CHECK and wait for FC to apply it
+            // Step 3 — Disable ARMING_CHECK and wait for FC to apply it
             await writeParam('ARMING_CHECK', 0, 6);
             await new Promise(resolve => setTimeout(resolve, 1000));
 
-            // Step 4 -- Arm with up to 3 retries (FC may reject first attempt)
+            // Step 4 — Arm with up to 3 retries (FC may reject first attempt)
             let armed = false;
             for (let attempt = 1; attempt <= 3; attempt++) {
               await sendMavlinkCommand('COMPONENT_ARM_DISARM', `${[1, 21196]}`, true);
@@ -225,7 +239,7 @@
               await new Promise(resolve => setTimeout(resolve, 500));
             }
 
-            // Step 5 -- Restore ARMING_CHECK regardless of arm result
+            // Step 5 — Restore ARMING_CHECK regardless of arm result
             await writeParam('ARMING_CHECK', 1, 6);
 
             if (!armed) {
@@ -241,22 +255,35 @@
               return;
             }
 
-            // Step 6 -- Takeoff to 10 m using current GPS position
-            // NAV_TAKEOFF in GUIDED mode needs current lat/lon in param5/6 (?1e7),
-            // NOT zeros ? zeros cause Cube Orange to ignore the command.
+            // Step 6 — Takeoff using current GPS position and altitude from NAV_TAKEOFF action, fallback 10 m
+            // NAV_TAKEOFF in GUIDED mode needs current lat/lon in param5/6 (×1e7),
+            // NOT zeros — zeros cause Cube Orange to ignore the command.
             const takeoffLoc = get(mavLocationStore);
             const takeoffLat = Math.round(takeoffLoc.lat * 1e7);
             const takeoffLon = Math.round(takeoffLoc.lng * 1e7);
-            // params: [pitch_deg, empty, empty, yaw_deg, lat?1e7, lon?1e7, alt_m]
-            await sendMavlinkCommand('NAV_TAKEOFF', `${[0, 0, 0, 0, takeoffLat, takeoffLon, 10]}`, false);
-            console.log(`[MissionPlan] NAV_TAKEOFF sent: lat=${takeoffLat} lon=${takeoffLon} alt=10m`);
+            const currentActions = get(missionPlanActionsStore);
+            const takeoffAction = Object.values(currentActions).find(a => a.type === 'NAV_TAKEOFF');
+            const takeoffAlt = (takeoffAction?.alt != null && takeoffAction.alt > 0) ? takeoffAction.alt : 10;
+            // params: [pitch_deg, empty, empty, yaw_deg, lat×1e7, lon×1e7, alt_m]
+            await sendMavlinkCommand('NAV_TAKEOFF', `${[0, 0, 0, 0, takeoffLat, takeoffLon, takeoffAlt]}`, false);
+            console.log(`[MissionPlan] NAV_TAKEOFF sent: lat=${takeoffLat} lon=${takeoffLon} alt=${takeoffAlt}m`);
 
-            // Step 7 -- Wait for the vehicle to reach takeoff altitude (up to 20 s)
-            await waitForAltitude(8, 20000);
+            // Step 7 — Wait for the vehicle to reach ~80% of takeoff altitude (up to 20 s)
+            await waitForAltitude(takeoffAlt * 0.8, 20000);
+
+          } else {
+            // ── ALREADY FLYING: switch to GUIDED, then directly to AUTO ─────
+            // Per ArduPilot GUIDED mode docs: while airborne, switching to GUIDED
+            // holds the vehicle at its current position. Switching to AUTO then
+            // resumes the loaded mission from the beginning.
+            console.log('[MissionPlan] Vehicle already airborne — switching to GUIDED then AUTO.');
+            await sendMavlinkCommand('DO_SET_MODE', `${[1, 4]}`, true); // GUIDED (mode 4)
+            await new Promise(resolve => setTimeout(resolve, 500)); // brief hold in GUIDED
           }
 
-          // Step 9 — Switch to AUTO and begin mission
-          await sendMavlinkCommand('DO_SET_MODE', `${[1, 3]}`, true);
+          // Final step — Switch to AUTO and begin mission
+          await sendMavlinkCommand('DO_SET_MODE', `${[1, 3]}`, true); // AUTO (mode 3)
+          console.log('[MissionPlan] Switched to AUTO — mission running.');
 
           const notification = new Notification({
             target: document.body,
